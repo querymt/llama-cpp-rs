@@ -137,8 +137,8 @@ pub struct ChatTemplateResult {
     pub chat_format: i32,
     /// Optional serialized PEG parser for tool-call parsing.
     pub parser: Option<String>,
-    /// Whether the parser expects a forced-open thinking block.
-    pub thinking_forced_open: bool,
+    /// Generation prompt prefix for reasoning tag prefill detection.
+    pub generation_prompt: Option<String>,
     /// Whether tool calls should be parsed from the response.
     pub parse_tool_calls: bool,
 }
@@ -963,7 +963,7 @@ impl LlamaModel {
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
             chat_format: 0,
-            thinking_forced_open: false,
+            generation_prompt: ptr::null_mut(),
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
             grammar_triggers_count: 0,
@@ -1109,7 +1109,14 @@ impl LlamaModel {
                 additional_stops,
                 chat_format: raw_result.chat_format,
                 parser,
-                thinking_forced_open: raw_result.thinking_forced_open,
+                generation_prompt: if raw_result.generation_prompt.is_null() {
+                    None
+                } else {
+                    let bytes = unsafe { CStr::from_ptr(raw_result.generation_prompt) }
+                        .to_bytes()
+                        .to_vec();
+                    Some(String::from_utf8(bytes)?)
+                },
                 parse_tool_calls,
             })
         })();
@@ -1139,7 +1146,7 @@ impl LlamaModel {
             grammar: ptr::null_mut(),
             parser: ptr::null_mut(),
             chat_format: 0,
-            thinking_forced_open: false,
+            generation_prompt: ptr::null_mut(),
             grammar_lazy: false,
             grammar_triggers: ptr::null_mut(),
             grammar_triggers_count: 0,
@@ -1305,7 +1312,14 @@ impl LlamaModel {
                 additional_stops,
                 chat_format: raw_result.chat_format,
                 parser,
-                thinking_forced_open: raw_result.thinking_forced_open,
+                generation_prompt: if raw_result.generation_prompt.is_null() {
+                    None
+                } else {
+                    let bytes = unsafe { CStr::from_ptr(raw_result.generation_prompt) }
+                        .to_bytes()
+                        .to_vec();
+                    Some(String::from_utf8(bytes)?)
+                },
                 parse_tool_calls,
             })
         })();
@@ -1324,6 +1338,11 @@ impl ChatTemplateResult {
     ) -> Result<String, ChatParseError> {
         let text_cstr = CString::new(text)?;
         let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
+        let gen_prompt_cstr = self
+            .generation_prompt
+            .as_deref()
+            .map(CString::new)
+            .transpose()?;
         let mut out_json: *mut c_char = ptr::null_mut();
         let rc = unsafe {
             llama_cpp_sys_2::llama_rs_chat_parse_to_oaicompat(
@@ -1334,7 +1353,9 @@ impl ChatTemplateResult {
                 parser_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                self.thinking_forced_open,
+                gen_prompt_cstr
+                    .as_ref()
+                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
                 &mut out_json,
             )
         };
@@ -1357,6 +1378,11 @@ impl ChatTemplateResult {
     /// Initialize a streaming parser for OpenAI-compatible chat deltas.
     pub fn streaming_state_oaicompat(&self) -> Result<ChatParseStateOaicompat, ChatParseError> {
         let parser_cstr = self.parser.as_deref().map(CString::new).transpose()?;
+        let gen_prompt_cstr = self
+            .generation_prompt
+            .as_deref()
+            .map(CString::new)
+            .transpose()?;
         let state = unsafe {
             llama_cpp_sys_2::llama_rs_chat_parse_state_init_oaicompat(
                 self.chat_format,
@@ -1364,7 +1390,9 @@ impl ChatTemplateResult {
                 parser_cstr
                     .as_ref()
                     .map_or(ptr::null(), |cstr| cstr.as_ptr()),
-                self.thinking_forced_open,
+                gen_prompt_cstr
+                    .as_ref()
+                    .map_or(ptr::null(), |cstr| cstr.as_ptr()),
             )
         };
         let state = NonNull::new(state).ok_or(ChatParseError::NullResult)?;
