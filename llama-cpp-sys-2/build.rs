@@ -1118,6 +1118,9 @@ fn main() {
             mtmd_build.cpp_link_stdlib(None);
         }
 
+        // mtmd uses the shared SHA-256 helper for stable bitmap identifiers.
+        mtmd_build.file(llama_src.join("vendor/hash/hash.cpp"));
+
         // Collect all .cpp files in tools/mtmd and its subdirectories
         for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
             match entry {
