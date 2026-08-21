@@ -1104,6 +1104,7 @@ fn main() {
             .include(llama_src.join("ggml/include"))
             .include(llama_src.join("common"))
             .include(llama_src.join("vendor"))
+            .include(llama_src.join("vendor/hash"))
             .flag_if_supported("-std=c++17")
             .flag_if_supported("-Wno-cast-qual")
             .pic(true);
