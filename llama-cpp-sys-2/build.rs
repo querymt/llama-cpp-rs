@@ -1119,7 +1119,9 @@ fn main() {
         }
 
         // mtmd uses the shared SHA-256 helper for stable bitmap identifiers.
-        mtmd_build.file(llama_src.join("vendor/hash/hash.cpp"));
+        mtmd_build
+            .file(llama_src.join("vendor/hash/hash.cpp"))
+            .file(llama_src.join("vendor/hash/sha256/sha256.c"));
 
         // Collect all .cpp files in tools/mtmd and its subdirectories
         for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
