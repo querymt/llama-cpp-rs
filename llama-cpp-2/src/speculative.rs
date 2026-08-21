@@ -7,9 +7,20 @@ use crate::llama_batch::LlamaBatch;
 use crate::status_is_ok;
 use crate::token::LlamaToken;
 
-/// Parameters for same-model MTP speculative decoding.
+/// Speculative decoding implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpeculativeType {
+    /// Multi-token prediction using bundled tensors or a sidecar model.
+    Mtp,
+    /// DFlash, including DFlash2 models detected through GGUF metadata.
+    DraftDflash,
+}
+
+/// Parameters for model-based speculative decoding.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MtpSpeculativeParams {
+pub struct SpeculativeParams {
+    /// Speculative decoding implementation.
+    pub kind: SpeculativeType,
     /// Maximum number of draft tokens to propose.
     pub n_max: i32,
     /// Minimum number of draft tokens required before returning a draft.
@@ -18,9 +29,10 @@ pub struct MtpSpeculativeParams {
     pub p_min: f32,
 }
 
-impl Default for MtpSpeculativeParams {
+impl Default for SpeculativeParams {
     fn default() -> Self {
         Self {
+            kind: SpeculativeType::Mtp,
             n_max: 3,
             n_min: 0,
             p_min: 0.0,
@@ -30,7 +42,7 @@ impl Default for MtpSpeculativeParams {
 
 /// Errors returned by the MTP speculative wrapper.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum MtpSpeculativeError {
+pub enum SpeculativeError {
     /// Invalid parameters were provided.
     #[error("invalid MTP speculative parameters")]
     InvalidParams,
@@ -41,8 +53,20 @@ pub enum MtpSpeculativeError {
     #[error("llama.cpp MTP speculative call failed with status {0}")]
     Status(i32),
     /// The draft output exceeded the caller-provided bound.
-    #[error("llama.cpp MTP draft exceeded configured maximum")]
+    #[error("llama.cpp speculative draft exceeded configured maximum")]
     DraftOverflow,
+    /// Verification output exceeded the caller-provided bound.
+    #[error("llama.cpp speculative verification exceeded configured maximum")]
+    VerificationOverflow,
+}
+
+/// Target-approved tokens from one speculative verification round.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SpeculativeVerification {
+    /// Accepted draft prefix followed by one target continuation token.
+    pub tokens: Vec<LlamaToken>,
+    /// Number of draft tokens accepted before the continuation token.
+    pub accepted: usize,
 }
 
 /// RAII owner for a same-model MTP speculative context.
@@ -50,14 +74,14 @@ pub enum MtpSpeculativeError {
 /// This wrapper currently binds llama.cpp's speculative state to sequence 0.
 /// Batches passed to [`Self::process`] must therefore contain only sequence 0.
 #[derive(Debug)]
-pub struct MtpSpeculative<'model> {
-    raw: NonNull<llama_cpp_sys_2::llama_rs_mtp_speculative>,
+pub struct Speculative<'model> {
+    raw: NonNull<llama_cpp_sys_2::llama_rs_speculative>,
     target_context: LlamaContext<'model>,
     draft_context: LlamaContext<'model>,
     n_max: usize,
 }
 
-impl<'model> MtpSpeculative<'model> {
+impl<'model> Speculative<'model> {
     /// Create a new MTP speculative helper from a target context and an MTP
     /// draft context.
     ///
@@ -68,16 +92,23 @@ impl<'model> MtpSpeculative<'model> {
     pub fn new(
         target_context: LlamaContext<'model>,
         draft_context: LlamaContext<'model>,
-        params: MtpSpeculativeParams,
-    ) -> Result<Self, MtpSpeculativeError> {
+        params: SpeculativeParams,
+    ) -> Result<Self, SpeculativeError> {
         if params.n_max <= 0 || params.n_min < 0 || params.n_min > params.n_max {
-            return Err(MtpSpeculativeError::InvalidParams);
+            return Err(SpeculativeError::InvalidParams);
         }
-        let n_max =
-            usize::try_from(params.n_max).map_err(|_| MtpSpeculativeError::InvalidParams)?;
+        let n_max = usize::try_from(params.n_max).map_err(|_| SpeculativeError::InvalidParams)?;
 
+        if !params.p_min.is_finite() || !(0.0..=1.0).contains(&params.p_min) {
+            return Err(SpeculativeError::InvalidParams);
+        }
+        let kind = match params.kind {
+            SpeculativeType::Mtp => llama_cpp_sys_2::LLAMA_RS_SPECULATIVE_TYPE_MTP,
+            SpeculativeType::DraftDflash => llama_cpp_sys_2::LLAMA_RS_SPECULATIVE_TYPE_DRAFT_DFLASH,
+        };
         let raw = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_init(
+            llama_cpp_sys_2::llama_rs_speculative_init(
+                kind,
                 target_context.context.as_ptr(),
                 draft_context.context.as_ptr(),
                 params.n_max,
@@ -85,7 +116,7 @@ impl<'model> MtpSpeculative<'model> {
                 params.p_min,
             )
         };
-        let raw = NonNull::new(raw).ok_or(MtpSpeculativeError::InitFailed)?;
+        let raw = NonNull::new(raw).ok_or(SpeculativeError::InitFailed)?;
 
         Ok(Self {
             raw,
@@ -116,10 +147,10 @@ impl<'model> MtpSpeculative<'model> {
     /// # Errors
     ///
     /// Returns an error if llama.cpp rejects the call.
-    pub fn begin(&mut self, prompt_tokens: &[LlamaToken]) -> Result<(), MtpSpeculativeError> {
+    pub fn begin(&mut self, prompt_tokens: &[LlamaToken]) -> Result<(), SpeculativeError> {
         let prompt = tokens_to_raw(prompt_tokens);
         let status = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_begin(
+            llama_cpp_sys_2::llama_rs_speculative_begin(
                 self.raw.as_ptr(),
                 prompt.as_ptr(),
                 prompt.len(),
@@ -135,9 +166,9 @@ impl<'model> MtpSpeculative<'model> {
     /// # Errors
     ///
     /// Returns an error if llama.cpp cannot update the MTP draft context.
-    pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), MtpSpeculativeError> {
+    pub fn process(&mut self, batch: &LlamaBatch<'_>) -> Result<(), SpeculativeError> {
         let status = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_process(
+            llama_cpp_sys_2::llama_rs_speculative_process(
                 self.raw.as_ptr(),
                 std::ptr::from_ref(&batch.llama_batch),
             )
@@ -156,32 +187,65 @@ impl<'model> MtpSpeculative<'model> {
         n_past: i32,
         id_last: LlamaToken,
         prompt_tokens: &[LlamaToken],
-    ) -> Result<Vec<LlamaToken>, MtpSpeculativeError> {
+        temperature: f32,
+        seed: u32,
+    ) -> Result<Vec<LlamaToken>, SpeculativeError> {
         if n_past < 0 {
-            return Err(MtpSpeculativeError::InvalidParams);
+            return Err(SpeculativeError::InvalidParams);
         }
 
         let prompt = tokens_to_raw(prompt_tokens);
         let mut raw_out = vec![0; self.n_max];
         let mut out_len = 0_usize;
         let status = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_draft(
+            llama_cpp_sys_2::llama_rs_speculative_draft(
                 self.raw.as_ptr(),
                 n_past,
                 id_last.0,
                 prompt.as_ptr(),
                 prompt.len(),
+                temperature,
+                seed,
                 raw_out.as_mut_ptr(),
                 raw_out.len(),
                 &raw mut out_len,
             )
         };
         if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
-            return Err(MtpSpeculativeError::DraftOverflow);
+            return Err(SpeculativeError::DraftOverflow);
         }
         status_to_result(status)?;
         raw_out.truncate(out_len);
         Ok(raw_out.into_iter().map(LlamaToken).collect())
+    }
+
+    /// Verify the pending draft against target logits and update the sampler.
+    pub fn verify(
+        &mut self,
+        sampler: &mut crate::sampling::LlamaSampler,
+    ) -> Result<SpeculativeVerification, SpeculativeError> {
+        let mut raw_out = vec![0; self.n_max + 1];
+        let mut out_len = 0_usize;
+        let mut accepted = 0_usize;
+        let status = unsafe {
+            llama_cpp_sys_2::llama_rs_speculative_verify(
+                self.raw.as_ptr(),
+                sampler.sampler,
+                raw_out.as_mut_ptr(),
+                raw_out.len(),
+                &raw mut out_len,
+                &raw mut accepted,
+            )
+        };
+        if status == llama_cpp_sys_2::LLAMA_RS_STATUS_ALLOCATION_FAILED {
+            return Err(SpeculativeError::VerificationOverflow);
+        }
+        status_to_result(status)?;
+        raw_out.truncate(out_len);
+        Ok(SpeculativeVerification {
+            tokens: raw_out.into_iter().map(LlamaToken).collect(),
+            accepted,
+        })
     }
 
     /// Notify llama.cpp how many draft tokens the target context accepted.
@@ -189,18 +253,17 @@ impl<'model> MtpSpeculative<'model> {
     /// # Errors
     ///
     /// Returns an error if llama.cpp rejects the call.
-    pub fn accept(&mut self, n_accepted: u16) -> Result<(), MtpSpeculativeError> {
-        let status = unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_accept(self.raw.as_ptr(), n_accepted)
-        };
+    pub fn accept(&mut self, n_accepted: u16) -> Result<(), SpeculativeError> {
+        let status =
+            unsafe { llama_cpp_sys_2::llama_rs_speculative_accept(self.raw.as_ptr(), n_accepted) };
         status_to_result(status)
     }
 }
 
-impl Drop for MtpSpeculative<'_> {
+impl Drop for Speculative<'_> {
     fn drop(&mut self) {
         unsafe {
-            llama_cpp_sys_2::llama_rs_mtp_speculative_free(self.raw.as_ptr());
+            llama_cpp_sys_2::llama_rs_speculative_free(self.raw.as_ptr());
         }
     }
 }
@@ -209,10 +272,10 @@ fn tokens_to_raw(tokens: &[LlamaToken]) -> Vec<llama_cpp_sys_2::llama_token> {
     tokens.iter().map(|token| token.0).collect()
 }
 
-fn status_to_result(status: llama_cpp_sys_2::llama_rs_status) -> Result<(), MtpSpeculativeError> {
+fn status_to_result(status: llama_cpp_sys_2::llama_rs_status) -> Result<(), SpeculativeError> {
     if status_is_ok(status) {
         Ok(())
     } else {
-        Err(MtpSpeculativeError::Status(status as i32))
+        Err(SpeculativeError::Status(status as i32))
     }
 }
